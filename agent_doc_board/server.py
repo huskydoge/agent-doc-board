@@ -9,6 +9,7 @@ import json
 import mimetypes
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 from agent_doc_board.scanner import build_manifest
 
@@ -47,6 +48,7 @@ class BoardRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/manifest":
             manifest = _load_or_build_manifest(self.project_root)
             manifest["doc_state"] = _load_doc_state(self.project_root)
+            _attach_annotation_counts(self.project_root, manifest)
             self._send_json(manifest)
             return
         if parsed.path == "/api/doc-state":
@@ -75,6 +77,9 @@ class BoardRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/doc-state":
             self._update_doc_state()
+            return
+        if parsed.path == "/api/annotations":
+            self._update_annotations()
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -110,12 +115,13 @@ class BoardRequestHandler(BaseHTTPRequestHandler):
                 "related": doc.get("related", []),
                 "topic_timeline": doc.get("topic_timeline", []),
                 "state": _load_doc_state(self.project_root).get(doc["path"], {}),
+                "annotations": _load_doc_annotations(self.project_root, doc["path"]),
                 "content": path.read_text(errors="replace"),
             }
         )
 
     def _update_doc_state(self) -> None:
-        """Persist read status or side comments for one board document."""
+        """Persist read status or whole-document side notes for one board document."""
         body = self._read_json_body()
         requested = str(body.get("path", ""))
         manifest = _load_or_build_manifest(self.project_root)
@@ -136,6 +142,39 @@ class BoardRequestHandler(BaseHTTPRequestHandler):
         state[requested] = entry
         _write_doc_state(self.project_root, state)
         self._send_json({"path": requested, "state": entry})
+
+    def _update_annotations(self) -> None:
+        """Create, update, or delete element-level annotations for one document."""
+        body = self._read_json_body()
+        requested = str(body.get("path", ""))
+        manifest = _load_or_build_manifest(self.project_root)
+        docs_by_path = {doc["path"]: doc for doc in manifest.get("docs", [])}
+        if requested not in docs_by_path:
+            self.send_error(HTTPStatus.NOT_FOUND, "Document is not in the board manifest")
+            return
+
+        annotations = _load_doc_annotations(self.project_root, requested)
+        action = str(body.get("action", "save"))
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        if action == "save":
+            annotation = _normalize_annotation(body.get("annotation", {}))
+            annotation_id = annotation["id"]
+            previous = next((item for item in annotations if item.get("id") == annotation_id), None)
+            annotation["created_at"] = previous.get("created_at", now) if previous else now
+            annotation["updated_at"] = now
+            annotations = [item for item in annotations if item.get("id") != annotation_id]
+            annotations.append(annotation)
+        elif action == "delete":
+            annotation_id = str(body.get("id", ""))[:120]
+            annotations = [item for item in annotations if item.get("id") != annotation_id]
+        else:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported annotation action")
+            return
+
+        annotations.sort(key=lambda item: (str(item.get("created_at", "")), str(item.get("id", ""))))
+        _write_doc_annotations(self.project_root, requested, annotations)
+        self._send_json({"path": requested, "annotations": annotations})
 
     def _read_json_body(self) -> dict:
         """Read a small JSON request body from the client."""
@@ -184,6 +223,74 @@ def _load_or_build_manifest(root: Path) -> dict:
         return json.loads(manifest_path.read_text())
     return build_manifest(root)
 
+
+def _attach_annotation_counts(root: Path, manifest: dict) -> None:
+    """Attach lightweight per-document annotation counts to a manifest payload."""
+    for doc in manifest.get("docs", []):
+        path = doc.get("path")
+        doc["annotation_count"] = len(_load_doc_annotations(root, path)) if path else 0
+
+
+def _annotation_path(root: Path, doc_path: str) -> Path:
+    """Return the sidecar annotation path for a document path."""
+    annotations_root = (root / ".agent-docs" / "annotations").resolve()
+    relative = Path(*Path(doc_path).parts)
+    path = (annotations_root / relative).resolve()
+    return path.with_name(path.name + ".json")
+
+
+def _load_doc_annotations(root: Path, doc_path: str) -> list[dict]:
+    """Load element-level annotations for one document."""
+    path = _annotation_path(root, doc_path)
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    if isinstance(payload, list):
+        annotations = payload
+    elif isinstance(payload, dict):
+        annotations = payload.get("annotations", [])
+    else:
+        annotations = []
+    return [item for item in annotations if isinstance(item, dict)]
+
+
+def _write_doc_annotations(root: Path, doc_path: str, annotations: list[dict]) -> None:
+    """Persist element-level annotations for one document."""
+    path = _annotation_path(root, doc_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"path": doc_path, "annotations": annotations}
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _normalize_annotation(raw: object) -> dict:
+    """Clamp and normalize one annotation payload from the browser."""
+    source = raw if isinstance(raw, dict) else {}
+    anchor_source = source.get("anchor", {}) if isinstance(source.get("anchor", {}), dict) else {}
+    annotation_id = str(source.get("id") or f"ann_{uuid4().hex}")[:120]
+    anchor = {
+        "type": _trim_text(anchor_source.get("type", "block"), 40),
+        "selector": _trim_text(anchor_source.get("selector", ""), 500),
+        "kind": _trim_text(anchor_source.get("kind", ""), 40),
+        "text_fingerprint": _trim_text(anchor_source.get("text_fingerprint", ""), 500),
+    }
+    try:
+        anchor["block_index"] = int(anchor_source.get("block_index", -1))
+    except (TypeError, ValueError):
+        anchor["block_index"] = -1
+    return {
+        "id": annotation_id,
+        "anchor": anchor,
+        "quote": _trim_text(source.get("quote", ""), 5000),
+        "comment": _trim_text(source.get("comment", ""), 20000),
+    }
+
+
+def _trim_text(value: object, limit: int) -> str:
+    """Convert a value to text and clamp it to a maximum length."""
+    return str(value or "")[:limit]
 
 def _doc_state_path(root: Path) -> Path:
     """Return the local per-document state file path."""
@@ -1084,6 +1191,170 @@ select {
   vertical-align: top;
 }
 
+.annotation-target.annotation-focused {
+  outline: 2px solid #b5b5b5;
+  outline-offset: 3px;
+  background: #fbfbfb;
+}
+
+.annotation-gutter {
+  position: absolute;
+  inset: 0 auto auto 0;
+  z-index: 42;
+  pointer-events: none;
+}
+
+.annotation-pin {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--muted);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  opacity: 0.35;
+  pointer-events: auto;
+}
+
+.annotation-pin:hover,
+.annotation-pin.has-comments {
+  opacity: 1;
+  color: var(--text);
+  border-color: #cfcfcf;
+}
+
+.annotation-pin.has-comments {
+  background: #f6f6f6;
+}
+
+.annotation-panel-body {
+  display: grid;
+  gap: 9px;
+}
+
+.annotation-card {
+  display: grid;
+  gap: 7px;
+  padding: 9px 0;
+  border-top: 1px solid #eeeeee;
+}
+
+.annotation-card:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.annotation-quote {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.annotation-comment {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.annotation-meta {
+  color: var(--soft);
+  font-size: 11px;
+}
+
+.annotation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.annotation-actions button,
+.annotation-inline-action {
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.annotation-composer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: start center;
+  padding: 72px 18px 18px;
+  background: rgba(20, 20, 20, 0.12);
+}
+
+.annotation-composer {
+  width: min(560px, calc(100vw - 36px));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--paper);
+  box-shadow: var(--shadow-strong);
+  padding: 15px;
+}
+
+.annotation-composer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.annotation-composer h2 {
+  margin: 0;
+  font-family: Georgia, "Times New Roman", Times, serif;
+  font-size: 19px;
+}
+
+.annotation-composer textarea {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--paper);
+  color: var(--text);
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.annotation-composer-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.annotation-composer-buttons button {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--paper);
+  color: var(--text);
+  cursor: pointer;
+  padding: 6px 9px;
+  font-size: 12px;
+  font-weight: 750;
+}
+
 .toast {
   position: fixed;
   left: 50%;
@@ -1217,6 +1488,15 @@ select {
     display: none;
   }
 
+  .annotation-gutter {
+    display: none;
+  }
+
+  .annotation-composer-backdrop {
+    align-items: start;
+    padding-top: 28px;
+  }
+
   .markdown {
     font-size: 15px;
     max-width: 100%;
@@ -1238,6 +1518,8 @@ let activeCategory = "all";
 let activeDoc = null;
 let activeDocData = null;
 let docState = {};
+let activeDocAnnotations = [];
+let activeAnnotationAnchors = {};
 const COMMENT_PANEL_POSITION_KEY = "agent-doc-board:comment-panel-position:v2";
 
 const el = (id) => document.getElementById(id);
@@ -1263,8 +1545,14 @@ function bindChrome() {
   el("close-reader").addEventListener("click", closeReader);
   el("focus-todo").addEventListener("click", () => el("todo-panel").scrollIntoView({ behavior: "smooth" }));
   window.addEventListener("hashchange", openDocFromHash);
-  window.addEventListener("resize", refreshCommentPanelLayout);
-  window.addEventListener("scroll", syncCommentPanelToViewport, { passive: true });
+  window.addEventListener("resize", () => {
+    refreshCommentPanelLayout();
+    setupAnnotationLayer();
+  });
+  window.addEventListener("scroll", () => {
+    syncCommentPanelToViewport();
+    reflowAnnotationGutter();
+  }, { passive: true });
   document.body.addEventListener("click", (event) => {
     const jump = event.target.closest("[data-jump-doc]");
     if (jump && !jump.classList.contains("current")) {
@@ -1285,6 +1573,55 @@ function bindChrome() {
       event.preventDefault();
       event.stopPropagation();
       saveSideComment(saveButton.dataset.saveComment);
+      return;
+    }
+    const annotationPin = event.target.closest("[data-annotation-pin]");
+    if (annotationPin) {
+      event.preventDefault();
+      event.stopPropagation();
+      openAnnotationComposer(annotationPin.dataset.annotationPin);
+      return;
+    }
+    const annotationJump = event.target.closest("[data-jump-annotation]");
+    if (annotationJump) {
+      event.preventDefault();
+      event.stopPropagation();
+      focusAnnotation(annotationJump.dataset.jumpAnnotation);
+      return;
+    }
+    const annotationEdit = event.target.closest("[data-edit-annotation]");
+    if (annotationEdit) {
+      event.preventDefault();
+      event.stopPropagation();
+      editAnnotation(annotationEdit.dataset.editAnnotation);
+      return;
+    }
+    const annotationDelete = event.target.closest("[data-delete-annotation]");
+    if (annotationDelete) {
+      event.preventDefault();
+      event.stopPropagation();
+      deleteAnnotation(annotationDelete.dataset.deleteAnnotation);
+      return;
+    }
+    const annotationCopy = event.target.closest("[data-copy-annotation]");
+    if (annotationCopy) {
+      event.preventDefault();
+      event.stopPropagation();
+      copyAnnotationContext(annotationCopy.dataset.copyAnnotation);
+      return;
+    }
+    const annotationSave = event.target.closest("[data-save-annotation]");
+    if (annotationSave) {
+      event.preventDefault();
+      event.stopPropagation();
+      saveAnnotationFromComposer();
+      return;
+    }
+    const annotationClose = event.target.closest("[data-close-annotation-composer]");
+    if (annotationClose) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeAnnotationComposer();
       return;
     }
     const resetCommentPanel = event.target.closest("[data-reset-comment-panel]");
@@ -1476,11 +1813,12 @@ function renderDocCard(doc) {
   const relationText = relationCount ? ` · ${relationCount} related` : "";
   const readText = state.read_at ? ` · read ${formatDateTime(state.read_at)}` : "";
   const noteText = state.side_comment ? " · side note" : "";
+  const commentText = doc.annotation_count ? ` · ${doc.annotation_count} comment${doc.annotation_count === 1 ? "" : "s"}` : "";
   return `
     <article class="post-card" data-open-doc="${escapeAttr(doc.path)}" role="button" tabindex="0">
       <h3>${escapeHtml(doc.title)}${state.read_at ? `<span class="read-mark">Read</span>` : ""}</h3>
       <p class="summary">${escapeHtml(doc.summary || "No summary extracted yet.")}</p>
-      <span class="meta-line">${escapeHtml(formatDate(doc.mtime))} · ${escapeHtml(doc.path)} · ${escapeHtml(tags)}${escapeHtml(relationText)}${escapeHtml(readText)}${escapeHtml(noteText)}</span>
+      <span class="meta-line">${escapeHtml(formatDate(doc.mtime))} · ${escapeHtml(doc.path)} · ${escapeHtml(tags)}${escapeHtml(relationText)}${escapeHtml(readText)}${escapeHtml(noteText)}${escapeHtml(commentText)}</span>
       <span class="actions">
         <button data-copy="${escapeAttr(doc.abs_path)}" type="button">Copy Path</button>
         <button data-copy="${escapeAttr(markdownLink)}" type="button">Copy Markdown Link</button>
@@ -1506,6 +1844,7 @@ async function openDoc(path) {
   }
   const doc = await response.json();
   activeDocData = doc;
+  activeDocAnnotations = doc.annotations || [];
   docState[doc.path] = doc.state || docState[doc.path] || {};
   el("copy-doc-path").dataset.copy = doc.abs_path;
   el("reader-content").innerHTML = renderMarkdown(doc.content);
@@ -1515,6 +1854,7 @@ async function openDoc(path) {
   typesetMath(el("reader-content"));
   el("reader").hidden = false;
   el("list-view").hidden = true;
+  setupAnnotationLayer();
   el("reader").scrollIntoView({ behavior: "smooth", block: "start" });
   bindCopyButtons();
 }
@@ -1522,6 +1862,10 @@ async function openDoc(path) {
 function closeReader() {
   activeDoc = null;
   activeDocData = null;
+  activeDocAnnotations = [];
+  activeAnnotationAnchors = {};
+  removeAnnotationGutter();
+  closeAnnotationComposer();
   removeFloatingCommentPanel();
   el("reader").hidden = true;
   el("list-view").hidden = false;
@@ -1547,14 +1891,15 @@ function renderDocContext(doc) {
     </section>
     <section class="context-panel side-comment-panel" data-comment-panel>
       <div class="side-comment-head" data-comment-drag>
-        <h2>Side Comment</h2>
-        <button class="comment-reset" data-reset-comment-panel type="button" title="Reset comment panel position">Reset</button>
+        <h2>Side Note</h2>
+        <button class="comment-reset" data-reset-comment-panel type="button" title="Reset note panel position">Reset</button>
       </div>
       <div class="side-comment-box">
         <textarea id="side-comment" placeholder="Write a private note for this doc...">${escapeHtml(state.side_comment || "")}</textarea>
-        <button class="state-action" data-save-comment="${escapeAttr(doc.path)}" type="button">Save Comment</button>
+        <button class="state-action" data-save-comment="${escapeAttr(doc.path)}" type="button">Save Note</button>
       </div>
     </section>
+    ${renderAnnotationPanel(doc)}
     <section class="context-panel">
       <h2>Related</h2>
       ${related.length ? `<div class="context-list">${related.map(renderContextLink).join("")}</div>` : `<p class="context-empty">No related docs found yet. Add markdown links or shared topic tags.</p>`}
@@ -1586,7 +1931,7 @@ async function saveSideComment(path) {
   const area = el("side-comment");
   const state = await saveDocState(path, { side_comment: area ? area.value : "" });
   updateDocState(path, state);
-  showToast("Comment saved");
+  showToast("Note saved");
 }
 
 async function saveDocState(path, patch) {
@@ -1713,7 +2058,7 @@ function resetCommentPanelPosition() {
   if (panel) {
     applyDefaultCommentPanelPosition(panel);
   }
-  showToast("Comment panel reset");
+  showToast("Note panel reset");
 }
 
 function applyDefaultCommentPanelPosition(panel) {
@@ -1781,6 +2126,353 @@ function clampCommentPanelPosition(panel, left, top) {
 
 function isNarrowViewport() {
   return window.matchMedia("(max-width: 760px)").matches;
+}
+
+
+function renderAnnotationPanel(doc) {
+  // Render the per-element comments panel for the active document.
+  const count = activeDocAnnotations.length;
+  return `
+    <section class="context-panel" data-annotation-panel>
+      <h2>Comments${count ? ` (${count})` : ""}</h2>
+      <div class="annotation-panel-body">${renderAnnotationPanelBody()}</div>
+    </section>
+  `;
+}
+
+function renderAnnotationPanelBody() {
+  // Render the active document annotations as jumpable cards.
+  if (!activeDocAnnotations.length) {
+    return `<p class="context-empty">No element comments yet. Use the gutter + beside a paragraph, table, math block, code block, or heading.</p>`;
+  }
+  return activeDocAnnotations.map(renderAnnotationCard).join("");
+}
+
+function renderAnnotationCard(annotation) {
+  // Render one saved annotation with local edit and delete controls.
+  const quote = annotation.quote || annotation.anchor?.text_fingerprint || annotation.anchor?.kind || "Selected element";
+  return `
+    <article class="annotation-card" data-annotation-card="${escapeAttr(annotation.id)}">
+      <p class="annotation-quote">${escapeHtml(shortenText(quote, 180))}</p>
+      <p class="annotation-comment">${escapeHtml(annotation.comment || "")}</p>
+      <div class="annotation-meta">${escapeHtml(annotation.anchor?.kind || "block")} · ${escapeHtml(formatDateTime(annotation.updated_at || annotation.created_at || ""))}</div>
+      <div class="annotation-actions">
+        <button data-jump-annotation="${escapeAttr(annotation.id)}" type="button">Jump</button>
+        <button data-edit-annotation="${escapeAttr(annotation.id)}" type="button">Edit</button>
+        <button data-copy-annotation="${escapeAttr(annotation.id)}" type="button">Copy Context</button>
+        <button data-delete-annotation="${escapeAttr(annotation.id)}" type="button">Delete</button>
+      </div>
+    </article>
+  `;
+}
+
+function setupAnnotationLayer() {
+  // Discover rendered markdown elements and place annotation controls beside them.
+  removeAnnotationGutter();
+  activeAnnotationAnchors = {};
+  if (!activeDocData || isNarrowViewport()) {
+    refreshAnnotationPanel();
+    return;
+  }
+  const root = el("reader-content");
+  const targets = collectAnnotationTargets(root);
+  targets.forEach((target, index) => {
+    const anchor = buildAnnotationAnchor(root, target, index);
+    target.dataset.annotationAnchorId = anchor.id;
+    target.classList.add("annotation-target");
+    activeAnnotationAnchors[anchor.id] = { anchor, target };
+  });
+  renderAnnotationGutter();
+  refreshAnnotationPanel();
+}
+
+function collectAnnotationTargets(root) {
+  // Collect block-like rendered elements, including non-text blocks such as tables, code, math, and images.
+  const selector = [
+    "h1", "h2", "h3", "p", "li", "blockquote", "pre", "table", "img", ".katex-display"
+  ].join(",");
+  return Array.from(root.querySelectorAll(selector)).filter((node) => {
+    if (node.closest("[data-annotation-panel], [data-comment-panel]")) return false;
+    const rect = node.getBoundingClientRect();
+    if (!rect.width && !rect.height) return false;
+    const text = annotationElementText(node);
+    return text || node.tagName.toLowerCase() === "img" || node.tagName.toLowerCase() === "table";
+  });
+}
+
+function buildAnnotationAnchor(root, target, index) {
+  // Build a stable-enough anchor from the target's rendered path and text fingerprint.
+  const kind = target.tagName.toLowerCase();
+  const selector = cssPathFromRoot(root, target);
+  const text = annotationElementText(target);
+  const fingerprint = makeTextFingerprint(text || target.getAttribute("alt") || target.getAttribute("src") || kind);
+  return {
+    id: `${index}:${kind}:${fingerprint.slice(0, 28)}`,
+    type: "block",
+    selector,
+    kind,
+    block_index: index,
+    text_fingerprint: fingerprint,
+  };
+}
+
+function cssPathFromRoot(root, node) {
+  // Generate a compact CSS path relative to the markdown root.
+  const parts = [];
+  let current = node;
+  while (current && current !== root) {
+    const parent = current.parentElement;
+    if (!parent) break;
+    const tag = current.tagName.toLowerCase();
+    const siblings = Array.from(parent.children).filter((child) => child.tagName === current.tagName);
+    const index = siblings.indexOf(current) + 1;
+    parts.unshift(`${tag}:nth-of-type(${index})`);
+    current = parent;
+  }
+  return parts.join(" > ");
+}
+
+function annotationElementText(node) {
+  // Produce a readable text snapshot for any commentable element.
+  if (!node) return "";
+  if (node.tagName && node.tagName.toLowerCase() === "img") {
+    return node.getAttribute("alt") || node.getAttribute("src") || "image";
+  }
+  return normalizeWhitespace(node.textContent || "");
+}
+
+function makeTextFingerprint(value) {
+  // Normalize text for anchor matching across small rendering changes.
+  return normalizeWhitespace(value).toLowerCase().slice(0, 240);
+}
+
+function renderAnnotationGutter() {
+  // Render the floating add/count buttons that sit beside document blocks.
+  removeAnnotationGutter();
+  const gutter = document.createElement("div");
+  gutter.id = "annotation-gutter";
+  gutter.className = "annotation-gutter";
+  Object.values(activeAnnotationAnchors).forEach(({ anchor }) => {
+    const comments = annotationsForAnchor(anchor);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `annotation-pin ${comments.length ? "has-comments" : ""}`;
+    button.dataset.annotationPin = anchor.id;
+    button.textContent = comments.length ? String(comments.length) : "+";
+    button.title = comments.length ? `${comments.length} comment(s)` : "Add comment";
+    gutter.appendChild(button);
+  });
+  document.body.appendChild(gutter);
+  reflowAnnotationGutter();
+}
+
+function reflowAnnotationGutter() {
+  // Keep gutter pins aligned with their anchored elements as the page scrolls.
+  const gutter = el("annotation-gutter");
+  if (!gutter) return;
+  gutter.querySelectorAll("[data-annotation-pin]").forEach((button) => {
+    const entry = activeAnnotationAnchors[button.dataset.annotationPin];
+    if (!entry) {
+      button.hidden = true;
+      return;
+    }
+    const rect = entry.target.getBoundingClientRect();
+    const visible = rect.bottom >= 0 && rect.top <= window.innerHeight && rect.width > 0 && rect.height > 0;
+    button.hidden = !visible;
+    if (!visible) return;
+    const left = Math.min(window.scrollX + rect.right + 8, window.scrollX + window.innerWidth - 34);
+    const top = window.scrollY + rect.top + 3;
+    button.style.left = `${Math.round(left)}px`;
+    button.style.top = `${Math.round(top)}px`;
+  });
+}
+
+function removeAnnotationGutter() {
+  // Remove the annotation overlay from the document body.
+  const gutter = el("annotation-gutter");
+  if (gutter) gutter.remove();
+}
+
+function annotationsForAnchor(anchor) {
+  // Return comments attached to the current rendered anchor.
+  return activeDocAnnotations.filter((annotation) => annotationMatchesAnchor(annotation, anchor));
+}
+
+function annotationMatchesAnchor(annotation, anchor) {
+  // Match by selector first, with fingerprint and block index as fallback.
+  const saved = annotation.anchor || {};
+  if (saved.selector && saved.selector === anchor.selector) return true;
+  if (saved.block_index === anchor.block_index && saved.kind === anchor.kind) return true;
+  return Boolean(saved.text_fingerprint && saved.text_fingerprint === anchor.text_fingerprint);
+}
+
+function openAnnotationComposer(anchorId, annotation = null) {
+  // Open the comment composer for a rendered anchor or an existing annotation.
+  const entry = activeAnnotationAnchors[anchorId];
+  if (!entry && !annotation) {
+    showToast("Could not find annotation target");
+    return;
+  }
+  const anchor = annotation ? annotation.anchor : entry.anchor;
+  const quote = annotation ? annotation.quote : selectedTextWithin(entry.target) || annotationElementText(entry.target);
+  closeAnnotationComposer();
+  const backdrop = document.createElement("div");
+  backdrop.className = "annotation-composer-backdrop";
+  backdrop.dataset.annotationComposer = "true";
+  backdrop.innerHTML = `
+    <section class="annotation-composer">
+      <div class="annotation-composer-head">
+        <h2>${annotation ? "Edit Comment" : "Add Comment"}</h2>
+        <button class="annotation-inline-action" data-close-annotation-composer type="button">Close</button>
+      </div>
+      <p class="annotation-quote">${escapeHtml(shortenText(quote || anchor.text_fingerprint || anchor.kind, 300))}</p>
+      <textarea id="annotation-comment-input" placeholder="Write a comment bound to this part of the doc...">${escapeHtml(annotation ? annotation.comment || "" : "")}</textarea>
+      <div class="annotation-composer-buttons">
+        <button data-close-annotation-composer type="button">Cancel</button>
+        <button data-save-annotation type="button">Save Comment</button>
+      </div>
+    </section>
+  `;
+  backdrop.dataset.annotationId = annotation ? annotation.id : makeAnnotationId();
+  backdrop.dataset.annotationAnchor = JSON.stringify(anchor);
+  backdrop.dataset.annotationQuote = quote || anchor.text_fingerprint || "";
+  document.body.appendChild(backdrop);
+  const input = el("annotation-comment-input");
+  if (input) input.focus();
+}
+
+function editAnnotation(annotationId) {
+  // Open an existing annotation in the composer.
+  const annotation = activeDocAnnotations.find((item) => item.id === annotationId);
+  if (!annotation) {
+    showToast("Comment not found");
+    return;
+  }
+  const anchorId = findAnchorIdForAnnotation(annotation);
+  openAnnotationComposer(anchorId, annotation);
+}
+
+async function saveAnnotationFromComposer() {
+  // Persist the currently open annotation composer.
+  const composer = document.querySelector("[data-annotation-composer]");
+  const input = el("annotation-comment-input");
+  if (!composer || !input || !activeDocData) return;
+  const comment = input.value.trim();
+  if (!comment) {
+    showToast("Write a comment first");
+    return;
+  }
+  const annotation = {
+    id: composer.dataset.annotationId,
+    anchor: JSON.parse(composer.dataset.annotationAnchor || "{}"),
+    quote: composer.dataset.annotationQuote || "",
+    comment,
+  };
+  await persistAnnotation({ action: "save", annotation });
+  closeAnnotationComposer();
+  showToast("Comment saved");
+}
+
+async function deleteAnnotation(annotationId) {
+  // Delete a saved annotation after a browser-level confirmation.
+  const annotation = activeDocAnnotations.find((item) => item.id === annotationId);
+  if (!annotation) return;
+  if (!window.confirm("Delete this comment?")) return;
+  await persistAnnotation({ action: "delete", id: annotationId });
+  showToast("Comment deleted");
+}
+
+async function persistAnnotation(payload) {
+  // Send an annotation mutation to the local board server and refresh local UI state.
+  const response = await fetch("/api/annotations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: activeDocData.path, ...payload }),
+  });
+  if (!response.ok) {
+    showToast("Could not save comment");
+    throw new Error("Could not save annotation");
+  }
+  const result = await response.json();
+  activeDocAnnotations = result.annotations || [];
+  activeDocData.annotations = activeDocAnnotations;
+  refreshAnnotationPanel();
+  renderAnnotationGutter();
+}
+
+function refreshAnnotationPanel() {
+  // Refresh the document comments panel without disturbing the floating Side Note editor.
+  const panel = document.querySelector("[data-annotation-panel] .annotation-panel-body");
+  if (panel) panel.innerHTML = renderAnnotationPanelBody();
+  const heading = document.querySelector("[data-annotation-panel] h2");
+  if (heading) heading.textContent = `Comments${activeDocAnnotations.length ? ` (${activeDocAnnotations.length})` : ""}`;
+}
+
+function closeAnnotationComposer() {
+  // Close any open annotation composer dialog.
+  document.querySelectorAll("[data-annotation-composer]").forEach((node) => node.remove());
+}
+
+function focusAnnotation(annotationId) {
+  // Scroll to and highlight the element associated with an annotation.
+  const annotation = activeDocAnnotations.find((item) => item.id === annotationId);
+  if (!annotation) return;
+  const anchorId = findAnchorIdForAnnotation(annotation);
+  const entry = activeAnnotationAnchors[anchorId];
+  if (!entry) {
+    showToast("Anchor not found in current render");
+    return;
+  }
+  entry.target.scrollIntoView({ behavior: "smooth", block: "center" });
+  document.querySelectorAll(".annotation-focused").forEach((node) => node.classList.remove("annotation-focused"));
+  entry.target.classList.add("annotation-focused");
+  setTimeout(() => entry.target.classList.remove("annotation-focused"), 1800);
+}
+
+function findAnchorIdForAnnotation(annotation) {
+  // Find the current rendered anchor id for a saved annotation.
+  const match = Object.values(activeAnnotationAnchors).find(({ anchor }) => annotationMatchesAnchor(annotation, anchor));
+  return match ? match.anchor.id : "";
+}
+
+async function copyAnnotationContext(annotationId) {
+  // Copy a compact annotation packet for discussion with an agent.
+  const annotation = activeDocAnnotations.find((item) => item.id === annotationId);
+  if (!annotation || !activeDocData) return;
+  const text = [
+    `Doc: ${activeDocData.path}`,
+    `Anchor: ${annotation.anchor?.kind || "block"} ${annotation.anchor?.selector || ""}`.trim(),
+    `Quote: ${annotation.quote || ""}`,
+    `Comment: ${annotation.comment || ""}`,
+  ].join("\n");
+  await copyText(text);
+  showToast("Comment context copied");
+}
+
+function selectedTextWithin(target) {
+  // Return the active text selection only when it belongs to the target element.
+  const selection = window.getSelection ? window.getSelection() : null;
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return "";
+  const range = selection.getRangeAt(0);
+  if (!target.contains(range.commonAncestorContainer)) return "";
+  return normalizeWhitespace(selection.toString()).slice(0, 1000);
+}
+
+function makeAnnotationId() {
+  // Create a compact browser-side id; the server preserves or replaces it as needed.
+  return `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeWhitespace(value) {
+  // Collapse whitespace for compact quotes and fingerprints.
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function shortenText(value, limit) {
+  // Shorten display text without changing the stored annotation payload.
+  const text = normalizeWhitespace(value);
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 1))}…`;
 }
 
 function renderContextLink(item) {
