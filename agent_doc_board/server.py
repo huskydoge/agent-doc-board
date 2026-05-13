@@ -905,6 +905,55 @@ select {
   font-weight: 750;
 }
 
+.side-comment-panel {
+  position: fixed;
+  top: 18px;
+  right: 22px;
+  z-index: 50;
+  width: min(360px, calc(100vw - 36px));
+  max-height: calc(100vh - 36px);
+  overflow: auto;
+  box-shadow: var(--shadow-strong);
+}
+
+.side-comment-panel.is-dragging {
+  opacity: 0.98;
+  user-select: none;
+}
+
+.side-comment-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.side-comment-head:active {
+  cursor: grabbing;
+}
+
+.side-comment-head h2 {
+  margin: 0;
+}
+
+.comment-reset {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--paper);
+  color: var(--muted);
+  cursor: pointer;
+  padding: 4px 7px;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.comment-reset:hover {
+  color: var(--text);
+}
+
 .side-comment-box {
   display: grid;
   gap: 8px;
@@ -912,7 +961,8 @@ select {
 
 .side-comment-box textarea {
   width: 100%;
-  min-height: 110px;
+  min-height: 150px;
+  max-height: min(42vh, 320px);
   resize: vertical;
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -1150,6 +1200,23 @@ select {
     position: static;
   }
 
+  .side-comment-panel {
+    position: sticky;
+    top: 10px;
+    right: auto;
+    width: auto;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .side-comment-head {
+    cursor: default;
+  }
+
+  .comment-reset {
+    display: none;
+  }
+
   .markdown {
     font-size: 15px;
     max-width: 100%;
@@ -1171,6 +1238,7 @@ let activeCategory = "all";
 let activeDoc = null;
 let activeDocData = null;
 let docState = {};
+const COMMENT_PANEL_POSITION_KEY = "agent-doc-board:comment-panel-position:v2";
 
 const el = (id) => document.getElementById(id);
 
@@ -1195,6 +1263,8 @@ function bindChrome() {
   el("close-reader").addEventListener("click", closeReader);
   el("focus-todo").addEventListener("click", () => el("todo-panel").scrollIntoView({ behavior: "smooth" }));
   window.addEventListener("hashchange", openDocFromHash);
+  window.addEventListener("resize", refreshCommentPanelLayout);
+  window.addEventListener("scroll", syncCommentPanelToViewport, { passive: true });
   document.body.addEventListener("click", (event) => {
     const jump = event.target.closest("[data-jump-doc]");
     if (jump && !jump.classList.contains("current")) {
@@ -1215,6 +1285,13 @@ function bindChrome() {
       event.preventDefault();
       event.stopPropagation();
       saveSideComment(saveButton.dataset.saveComment);
+      return;
+    }
+    const resetCommentPanel = event.target.closest("[data-reset-comment-panel]");
+    if (resetCommentPanel) {
+      event.preventDefault();
+      event.stopPropagation();
+      resetCommentPanelPosition();
     }
   });
   bindCopyButtons();
@@ -1433,6 +1510,8 @@ async function openDoc(path) {
   el("copy-doc-path").dataset.copy = doc.abs_path;
   el("reader-content").innerHTML = renderMarkdown(doc.content);
   el("reader-context").innerHTML = renderDocContext(doc);
+  mountCommentPanel();
+  bindCommentPanelDrag();
   typesetMath(el("reader-content"));
   el("reader").hidden = false;
   el("list-view").hidden = true;
@@ -1443,6 +1522,7 @@ async function openDoc(path) {
 function closeReader() {
   activeDoc = null;
   activeDocData = null;
+  removeFloatingCommentPanel();
   el("reader").hidden = true;
   el("list-view").hidden = false;
   if (location.hash.startsWith("#doc=")) {
@@ -1465,8 +1545,11 @@ function renderDocContext(doc) {
         <button class="state-action" data-mark-read="${escapeAttr(doc.path)}" type="button">Mark Read Now</button>
       </div>
     </section>
-    <section class="context-panel">
-      <h2>Side Comment</h2>
+    <section class="context-panel side-comment-panel" data-comment-panel>
+      <div class="side-comment-head" data-comment-drag>
+        <h2>Side Comment</h2>
+        <button class="comment-reset" data-reset-comment-panel type="button" title="Reset comment panel position">Reset</button>
+      </div>
       <div class="side-comment-box">
         <textarea id="side-comment" placeholder="Write a private note for this doc...">${escapeHtml(state.side_comment || "")}</textarea>
         <button class="state-action" data-save-comment="${escapeAttr(doc.path)}" type="button">Save Comment</button>
@@ -1528,8 +1611,176 @@ function updateDocState(path, state) {
   if (activeDocData && activeDocData.path === path) {
     activeDocData.state = state;
     el("reader-context").innerHTML = renderDocContext(activeDocData);
+    mountCommentPanel();
+    bindCommentPanelDrag();
   }
   renderDocs();
+}
+
+
+function mountCommentPanel() {
+  // Move the note editor out of the reader grid so fixed positioning is relative to the viewport.
+  const panel = el("reader-context").querySelector("[data-comment-panel]");
+  removeFloatingCommentPanel();
+  if (!panel || isNarrowViewport()) {
+    return;
+  }
+  document.body.appendChild(panel);
+}
+
+function removeFloatingCommentPanel() {
+  Array.from(document.body.children)
+    .filter((node) => node.matches && node.matches("[data-comment-panel]"))
+    .forEach((node) => node.remove());
+}
+
+function refreshCommentPanelLayout() {
+  // Reconcile body-mounted and in-flow layouts when the viewport crosses the mobile breakpoint.
+  if (!activeDocData) {
+    return;
+  }
+  el("reader-context").innerHTML = renderDocContext(activeDocData);
+  mountCommentPanel();
+  bindCommentPanelDrag();
+}
+
+function bindCommentPanelDrag() {
+  // Keep the side-comment panel visible while allowing users to place it where it is least intrusive.
+  const panel = document.querySelector("[data-comment-panel]");
+  const handle = document.querySelector("[data-comment-drag]");
+  restoreCommentPanelPosition();
+  if (!panel || !handle || panel.dataset.dragBound === "true") {
+    return;
+  }
+  panel.dataset.dragBound = "true";
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button, textarea, input, a")) {
+      return;
+    }
+    if (isNarrowViewport()) {
+      return;
+    }
+    event.preventDefault();
+    const rect = panel.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+    panel.classList.add("is-dragging");
+
+    const movePanel = (moveEvent) => {
+      const position = clampCommentPanelPosition(panel, moveEvent.clientX - offsetX, moveEvent.clientY - offsetY);
+      placeCommentPanelAtViewportPosition(panel, position.left, position.top);
+    };
+
+    const stopDrag = () => {
+      panel.classList.remove("is-dragging");
+      saveCommentPanelPosition(panel);
+      window.removeEventListener("pointermove", movePanel);
+      window.removeEventListener("pointerup", stopDrag);
+      window.removeEventListener("pointercancel", stopDrag);
+    };
+
+    window.addEventListener("pointermove", movePanel);
+    window.addEventListener("pointerup", stopDrag);
+    window.addEventListener("pointercancel", stopDrag);
+  });
+}
+
+function restoreCommentPanelPosition() {
+  // Reapply the saved floating-panel position and clamp it to the current viewport.
+  const panel = document.querySelector("[data-comment-panel]");
+  if (!panel) {
+    return;
+  }
+  if (isNarrowViewport()) {
+    panel.style.removeProperty("left");
+    panel.style.removeProperty("top");
+    panel.style.removeProperty("right");
+    return;
+  }
+  const position = loadCommentPanelPosition();
+  if (!position) {
+    applyDefaultCommentPanelPosition(panel);
+    return;
+  }
+  const clamped = clampCommentPanelPosition(panel, position.left, position.top);
+  placeCommentPanelAtViewportPosition(panel, clamped.left, clamped.top);
+}
+
+function resetCommentPanelPosition() {
+  // Return the floating comment panel to its default top-right placement.
+  localStorage.removeItem(COMMENT_PANEL_POSITION_KEY);
+  const panel = document.querySelector("[data-comment-panel]");
+  if (panel) {
+    applyDefaultCommentPanelPosition(panel);
+  }
+  showToast("Comment panel reset");
+}
+
+function applyDefaultCommentPanelPosition(panel) {
+  // Place the panel near the viewport top-right, independent of page scroll offset.
+  const rect = panel.getBoundingClientRect();
+  const width = rect.width || 360;
+  const left = Math.max(8, window.innerWidth - width - 22);
+  placeCommentPanelAtViewportPosition(panel, left, 18);
+}
+
+function placeCommentPanelAtViewportPosition(panel, left, top) {
+  // Fixed positioning pins the panel to the viewport while preserving draggable coordinates.
+  panel.dataset.viewportLeft = String(Math.round(left));
+  panel.dataset.viewportTop = String(Math.round(top));
+  panel.style.setProperty("position", "fixed", "important");
+  panel.style.setProperty("left", `${Math.round(left)}px`, "important");
+  panel.style.setProperty("top", `${Math.round(top)}px`, "important");
+  panel.style.setProperty("right", "auto", "important");
+}
+
+function syncCommentPanelToViewport() {
+  const panel = document.querySelector("[data-comment-panel]");
+  if (!panel || isNarrowViewport() || panel.classList.contains("is-dragging")) {
+    return;
+  }
+  const rect = panel.getBoundingClientRect();
+  const left = Number(panel.dataset.viewportLeft || rect.left || 0);
+  const top = Number(panel.dataset.viewportTop || rect.top || 18);
+  const clamped = clampCommentPanelPosition(panel, left, top);
+  placeCommentPanelAtViewportPosition(panel, clamped.left, clamped.top);
+}
+
+function loadCommentPanelPosition() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(COMMENT_PANEL_POSITION_KEY) || "null");
+    if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+      return saved;
+    }
+  } catch (_) {
+    localStorage.removeItem(COMMENT_PANEL_POSITION_KEY);
+  }
+  return null;
+}
+
+function saveCommentPanelPosition(panel) {
+  const rect = panel.getBoundingClientRect();
+  localStorage.setItem(COMMENT_PANEL_POSITION_KEY, JSON.stringify({
+    left: Math.round(Number(panel.dataset.viewportLeft || rect.left)),
+    top: Math.round(Number(panel.dataset.viewportTop || rect.top)),
+  }));
+}
+
+function clampCommentPanelPosition(panel, left, top) {
+  const rect = panel.getBoundingClientRect();
+  const margin = 8;
+  const width = rect.width || 360;
+  const height = Math.min(rect.height || 240, window.innerHeight - margin * 2);
+  const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+  const maxTop = Math.max(margin, window.innerHeight - height - margin);
+  return {
+    left: Math.min(Math.max(left, margin), maxLeft),
+    top: Math.min(Math.max(top, margin), maxTop),
+  };
+}
+
+function isNarrowViewport() {
+  return window.matchMedia("(max-width: 760px)").matches;
 }
 
 function renderContextLink(item) {
