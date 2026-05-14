@@ -1011,20 +1011,6 @@ select {
   line-height: 1.45;
 }
 
-.reference-entry {
-  display: grid;
-  gap: 7px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  background: #fbfbfb;
-  padding: 10px;
-}
-
-.reference-entry.is-focused {
-  border-color: #9a9a9a;
-  box-shadow: inset 4px 0 0 var(--rule);
-}
-
 .reference-key {
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -2060,7 +2046,6 @@ function renderDocContext(doc) {
       </div>
     </section>
     ${renderAnnotationPanel(doc)}
-    ${renderReferencesPanel(doc)}
     <section class="context-panel">
       <h2>Related</h2>
       ${related.length ? `<div class="context-list">${related.map(renderContextLink).join("")}</div>` : `<p class="context-empty">No related docs found yet. Add markdown links or shared topic tags.</p>`}
@@ -2076,21 +2061,6 @@ function renderDocContext(doc) {
     <section class="context-panel">
       <h2>Topic Timeline</h2>
       ${timeline.length ? `<div class="timeline-list">${timeline.map(renderTimelineLink).join("")}</div>` : `<p class="context-empty">No timeline entries for this topic yet.</p>`}
-    </section>
-  `;
-}
-
-function renderReferencesPanel(doc) {
-  // Render BibTeX-backed references cited by the active document.
-  const citations = doc.citations || [];
-  if (!citations.length) return "";
-  const refs = manifest.references || {};
-  return `
-    <section class="context-panel">
-      <h2>References</h2>
-      <div class="context-list">
-        ${citations.map((key) => renderReferenceEntry(key, refs[key])).join("")}
-      </div>
     </section>
   `;
 }
@@ -2134,32 +2104,6 @@ function renderPaperReferenceItem(key, ref) {
   `;
 }
 
-function renderReferenceEntry(key, ref) {
-  // Render one reference card, preserving missing keys as visible warnings.
-  if (!ref) {
-    return `
-      <article class="reference-entry missing" data-reference-entry="${escapeAttr(key)}">
-        <span class="reference-key">@${escapeHtml(key)}</span>
-        <span class="reference-title">Missing BibTeX entry</span>
-        <span class="reference-meta">Add this key to the configured bibliography file.</span>
-      </article>
-    `;
-  }
-  const meta = referenceMeta(ref);
-  const link = referenceUrl(ref);
-  return `
-    <article class="reference-entry" data-reference-entry="${escapeAttr(key)}">
-      <span class="reference-key">@${escapeHtml(key)}</span>
-      <span class="reference-title">${escapeHtml(ref.title || key)}</span>
-      <span class="reference-meta">${escapeHtml(meta)}</span>
-      <span class="actions">
-        ${link ? `<a href="${escapeAttr(link)}" target="_blank" rel="noreferrer">Open</a>` : ""}
-        <button data-copy="${escapeAttr(ref.raw || "")}" type="button">Copy BibTeX</button>
-      </span>
-    </article>
-  `;
-}
-
 function referenceMeta(ref) {
   // Format a compact author-year-venue line.
   return [ref.author || "", ref.year || "", ref.venue || ""].filter(Boolean).join(". ");
@@ -2184,14 +2128,13 @@ function referenceLinkLabel(ref, link) {
 function focusReference(key) {
   // Scroll from an in-text citation to the document-bottom reference entry when possible.
   const target =
-    document.querySelector(`.markdown-references [data-reference-entry="${cssEscape(key)}"]`) ||
-    document.querySelector(`[data-reference-entry="${cssEscape(key)}"]`);
+    document.querySelector(`.markdown-references [data-reference-entry="${cssEscape(key)}"]`);
   if (!target) {
     showToast("Reference not found");
     return;
   }
   target.scrollIntoView({ behavior: "smooth", block: "center" });
-  document.querySelectorAll(".reference-entry.is-focused, .paper-reference-item.is-focused").forEach((node) => node.classList.remove("is-focused"));
+  document.querySelectorAll(".paper-reference-item.is-focused").forEach((node) => node.classList.remove("is-focused"));
   target.classList.add("is-focused");
   setTimeout(() => target.classList.remove("is-focused"), 1800);
 }
