@@ -110,6 +110,8 @@ class BoardRequestHandler(BaseHTTPRequestHandler):
                 "summary": doc["summary"],
                 "tags": doc["tags"],
                 "date": doc.get("date", ""),
+                "citations": doc.get("citations", []),
+                "missing_citations": doc.get("missing_citations", []),
                 "outgoing_links": doc.get("outgoing_links", []),
                 "backlinks": doc.get("backlinks", []),
                 "related": doc.get("related", []),
