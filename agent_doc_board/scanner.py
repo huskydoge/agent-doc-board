@@ -20,7 +20,8 @@ def build_manifest(root: Path) -> dict:
     """Build a deterministic documentation manifest for a project root."""
     root = root.expanduser().resolve()
     config = load_config(root)
-    docs = [_doc_record(root, path, config) for path in _iter_markdown_files(root, config)]
+    references, reference_sources = _load_references(root, config.bibliography)
+    docs = [_doc_record(root, path, config, references) for path in _iter_markdown_files(root, config)]
     _attach_doc_graph(docs)
     todos = _read_or_seed_todos(root, config)
     data_refs = [_data_ref_record(root, ref) for ref in config.data_refs]
@@ -53,6 +54,8 @@ def build_manifest(root: Path) -> dict:
         "docs": docs,
         "todos": todos,
         "data_refs": data_refs,
+        "reference_sources": reference_sources,
+        "references": references,
     }
 
 
@@ -85,7 +88,7 @@ def _iter_markdown_files(root: Path, config: ProjectConfig) -> list[Path]:
     return [candidates[key] for key in sorted(candidates)]
 
 
-def _doc_record(root: Path, path: Path, config: ProjectConfig) -> dict:
+def _doc_record(root: Path, path: Path, config: ProjectConfig, references: dict[str, dict]) -> dict:
     """Build one markdown document record for the board manifest."""
     rel = path.relative_to(root).as_posix()
     text = path.read_text(errors="replace")
@@ -93,6 +96,7 @@ def _doc_record(root: Path, path: Path, config: ProjectConfig) -> dict:
     category = _category_for(rel, config.categories)
     summary = _extract_summary(text, title)
     stat = path.stat()
+    citations = _extract_citations(text)
     return {
         "id": hashlib.sha1(rel.encode("utf-8")).hexdigest()[:10],
         "title": title,
@@ -102,6 +106,8 @@ def _doc_record(root: Path, path: Path, config: ProjectConfig) -> dict:
         "status": _status_for(rel, title),
         "tags": _tags_for(rel, category),
         "summary": summary,
+        "citations": citations,
+        "missing_citations": [key for key in citations if key not in references],
         "date": _extract_doc_date(rel, text, stat),
         "mtime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(timespec="seconds"),
         "size_bytes": stat.st_size,
@@ -111,6 +117,174 @@ def _doc_record(root: Path, path: Path, config: ProjectConfig) -> dict:
         "topic_timeline": [],
         "_raw_links": _extract_markdown_links(text),
     }
+
+
+def _load_references(root: Path, bibliography: tuple[str, ...]) -> tuple[dict[str, dict], list[dict]]:
+    """Load configured BibTeX files into compact reference records."""
+    references: dict[str, dict] = {}
+    sources = []
+    for rel in bibliography:
+        path = (root / rel).resolve()
+        exists = path.exists()
+        source = {"path": rel, "abs_path": str(path), "exists": exists, "entries": 0}
+        if exists:
+            parsed = _parse_bibtex_file(path, rel)
+            references.update(parsed)
+            source["entries"] = len(parsed)
+        sources.append(source)
+    return dict(sorted(references.items())), sources
+
+
+def _parse_bibtex_file(path: Path, rel: str) -> dict[str, dict]:
+    """Parse a BibTeX file with a small dependency-free parser."""
+    text = path.read_text(errors="replace")
+    records = {}
+    index = 0
+    while True:
+        at = text.find("@", index)
+        if at == -1:
+            break
+        match = re.match(r"@([A-Za-z]+)\s*\{\s*([^,\s]+)\s*,", text[at:])
+        if not match:
+            index = at + 1
+            continue
+        entry_type = match.group(1).lower()
+        key = match.group(2).strip()
+        body_start = at + match.end()
+        entry_open = at + text[at:].find("{")
+        body_end = _find_matching_bib_brace(text, entry_open)
+        if body_end == -1:
+            index = body_start
+            continue
+        body = text[body_start:body_end]
+        raw_entry = text[at : body_end + 1].strip()
+        fields = _parse_bib_fields(body)
+        records[key] = _reference_record(key, entry_type, fields, raw_entry, rel)
+        index = body_end + 1
+    return records
+
+
+def _find_matching_bib_brace(text: str, open_index: int) -> int:
+    """Return the closing brace index for one BibTeX entry."""
+    depth = 0
+    escaped = False
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _parse_bib_fields(body: str) -> dict[str, str]:
+    """Parse BibTeX field assignments from an entry body."""
+    fields: dict[str, str] = {}
+    index = 0
+    while index < len(body):
+        while index < len(body) and body[index] in ", \n\r\t":
+            index += 1
+        name_match = re.match(r"([A-Za-z][A-Za-z0-9_-]*)\s*=", body[index:])
+        if not name_match:
+            index += 1
+            continue
+        name = name_match.group(1).lower()
+        index += name_match.end()
+        while index < len(body) and body[index].isspace():
+            index += 1
+        value, index = _read_bib_value(body, index)
+        fields[name] = _clean_bib_value(value)
+    return fields
+
+
+def _read_bib_value(body: str, index: int) -> tuple[str, int]:
+    """Read one BibTeX field value and return the new parse offset."""
+    if index >= len(body):
+        return "", index
+    if body[index] == "{":
+        start = index + 1
+        depth = 1
+        index += 1
+        escaped = False
+        while index < len(body):
+            char = body[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return body[start:index], index + 1
+            index += 1
+        return body[start:index], index
+    if body[index] == '"':
+        start = index + 1
+        index += 1
+        escaped = False
+        while index < len(body):
+            char = body[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                return body[start:index], index + 1
+            index += 1
+        return body[start:index], index
+    start = index
+    while index < len(body) and body[index] != ",":
+        index += 1
+    return body[start:index].strip(), index
+
+
+def _clean_bib_value(value: str) -> str:
+    """Normalize common BibTeX markup for compact browser display."""
+    cleaned = value.replace("\n", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.replace("{", "").replace("}", "")
+    cleaned = re.sub(r"\\['`^\"~=.]([A-Za-z])", r"\1", cleaned)
+    cleaned = cleaned.replace(r"\&", "&")
+    cleaned = cleaned.replace(r"\_", "_")
+    return cleaned
+
+
+def _reference_record(key: str, entry_type: str, fields: dict[str, str], raw_entry: str, source: str) -> dict:
+    """Create one compact reference payload for the browser UI."""
+    return {
+        "key": key,
+        "type": entry_type,
+        "title": fields.get("title", key),
+        "author": fields.get("author", ""),
+        "year": fields.get("year", ""),
+        "venue": fields.get("booktitle") or fields.get("journal") or fields.get("publisher") or "",
+        "doi": fields.get("doi", ""),
+        "url": fields.get("url", ""),
+        "eprint": fields.get("eprint", ""),
+        "archive_prefix": fields.get("archiveprefix", ""),
+        "source": source,
+        "raw": raw_entry,
+    }
+
+
+def _extract_citations(text: str) -> list[str]:
+    """Extract Pandoc-style citation keys from markdown text."""
+    keys = []
+    for match in re.finditer(r"(?<![\w.-])@([A-Za-z][A-Za-z0-9_:-]+)", text):
+        key = match.group(1)
+        if key not in keys:
+            keys.append(key)
+    return keys
 
 
 def _attach_doc_graph(docs: list[dict]) -> None:

@@ -42,6 +42,7 @@ class ProjectConfig:
 
     include: tuple[str, ...] = ("docs/**/*.md",)
     exclude: tuple[str, ...] = ()
+    bibliography: tuple[str, ...] = ()
     categories: tuple[CategoryRule, ...] = field(default_factory=tuple)
     todos: tuple[TodoSeed, ...] = field(default_factory=tuple)
     data_refs: tuple[DataRef, ...] = field(default_factory=tuple)
@@ -86,6 +87,7 @@ def load_config(root: Path) -> ProjectConfig:
     return ProjectConfig(
         include=tuple(str(pattern) for pattern in raw.get("include", ("docs/**/*.md",))),
         exclude=tuple(str(pattern) for pattern in raw.get("exclude", ())),
+        bibliography=tuple(str(path) for path in raw.get("bibliography", raw.get("bibtex", ()))),
         categories=categories or default_categories(),
         todos=todos,
         data_refs=data_refs,
@@ -102,4 +104,3 @@ def default_categories() -> tuple[CategoryRule, ...]:
         CategoryRule("systems-and-training", "Systems and Training", ("docs/*training*.md", "docs/*backprop*.md")),
         CategoryRule("external-settings", "External Settings", ("docs/*dataset*.md", "docs/*external*.md", "docs/*setting*.md")),
     )
-

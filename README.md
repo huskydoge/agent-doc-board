@@ -15,6 +15,7 @@ Python standard library. Project-specific behavior lives in
 - Generate `docs/INDEX.md` and seed `docs/TODO.md`.
 - Browse docs by category with search and date/title/category sorting.
 - Render markdown and KaTeX math locally.
+- Resolve Pandoc-style citations such as `[@key]` from configured BibTeX files.
 - Show outgoing links, backlinks, related docs, and topic timelines.
 - Keep local per-document read checks and side comments in
   `.agent-docs/doc_state.json`.
@@ -50,7 +51,7 @@ http://127.0.0.1:8765
 
 ## Project Files
 
-- `.agent-docs/config.toml`: project-specific include rules, categories, TODO seeds, and data references.
+- `.agent-docs/config.toml`: project-specific include rules, categories, TODO seeds, BibTeX files, and data references.
 - `.agent-docs/manifest.json`: generated manifest consumed by the board.
 - `.agent-docs/doc_state.json`: local read-check timestamps and side comments.
 - `docs/INDEX.md`: generated documentation index.
@@ -63,6 +64,7 @@ The scanner does not move or rename existing documents.
 ```toml
 include = ["docs/**/*.md"]
 exclude = ["docs/INDEX.md", "docs/TODO.md"]
+bibliography = ["docs/paper/references.bib"]
 
 [[categories]]
 id = "topics"

@@ -1009,6 +1009,56 @@ select {
   line-height: 1.45;
 }
 
+.reference-entry {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #fbfbfb;
+  padding: 10px;
+}
+
+.reference-entry.is-focused {
+  border-color: #9a9a9a;
+  box-shadow: inset 4px 0 0 var(--rule);
+}
+
+.reference-key {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.reference-title {
+  color: var(--text);
+  font-weight: 750;
+  line-height: 1.35;
+}
+
+.reference-meta {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.citation-link {
+  display: inline;
+  border: 0;
+  background: transparent;
+  color: #245a8d;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.citation-link.missing {
+  color: #9b3b34;
+  text-decoration-style: dotted;
+}
+
 .read-status {
   display: grid;
   gap: 8px;
@@ -1665,6 +1715,13 @@ function bindChrome() {
       event.preventDefault();
       event.stopPropagation();
       resetCommentPanelPosition();
+      return;
+    }
+    const referenceJump = event.target.closest("[data-ref-key]");
+    if (referenceJump) {
+      event.preventDefault();
+      event.stopPropagation();
+      focusReference(referenceJump.dataset.refKey);
     }
   });
   bindCopyButtons();
@@ -1872,11 +1929,12 @@ function renderDocCard(doc) {
   const noteText = state.side_comment ? " · side note" : "";
   const commentText = doc.annotation_count ? ` · ${doc.annotation_count} comment${doc.annotation_count === 1 ? "" : "s"}` : "";
   const statusText = isArchivedDoc(doc) ? " · archived" : "";
+  const referenceText = (doc.citations || []).length ? ` · ${(doc.citations || []).length} refs` : "";
   return `
     <article class="post-card" data-open-doc="${escapeAttr(doc.path)}" role="button" tabindex="0">
       <h3>${escapeHtml(doc.title)}${state.read_at ? `<span class="read-mark">Read</span>` : ""}</h3>
       <p class="summary">${escapeHtml(doc.summary || "No summary extracted yet.")}</p>
-      <span class="meta-line">${escapeHtml(formatDate(doc.mtime))} · ${escapeHtml(doc.path)} · ${escapeHtml(tags)}${escapeHtml(statusText)}${escapeHtml(relationText)}${escapeHtml(readText)}${escapeHtml(noteText)}${escapeHtml(commentText)}</span>
+      <span class="meta-line">${escapeHtml(formatDate(doc.mtime))} · ${escapeHtml(doc.path)} · ${escapeHtml(tags)}${escapeHtml(statusText)}${escapeHtml(relationText)}${escapeHtml(referenceText)}${escapeHtml(readText)}${escapeHtml(noteText)}${escapeHtml(commentText)}</span>
       <span class="actions">
         <button data-copy="${escapeAttr(doc.abs_path)}" type="button">Copy Path</button>
         <button data-copy="${escapeAttr(markdownLink)}" type="button">Copy Markdown Link</button>
@@ -1960,6 +2018,7 @@ function renderDocContext(doc) {
       </div>
     </section>
     ${renderAnnotationPanel(doc)}
+    ${renderReferencesPanel(doc)}
     <section class="context-panel">
       <h2>Related</h2>
       ${related.length ? `<div class="context-list">${related.map(renderContextLink).join("")}</div>` : `<p class="context-empty">No related docs found yet. Add markdown links or shared topic tags.</p>`}
@@ -1977,6 +2036,73 @@ function renderDocContext(doc) {
       ${timeline.length ? `<div class="timeline-list">${timeline.map(renderTimelineLink).join("")}</div>` : `<p class="context-empty">No timeline entries for this topic yet.</p>`}
     </section>
   `;
+}
+
+function renderReferencesPanel(doc) {
+  // Render BibTeX-backed references cited by the active document.
+  const citations = doc.citations || [];
+  if (!citations.length) return "";
+  const refs = manifest.references || {};
+  return `
+    <section class="context-panel">
+      <h2>References</h2>
+      <div class="context-list">
+        ${citations.map((key) => renderReferenceEntry(key, refs[key])).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderReferenceEntry(key, ref) {
+  // Render one reference card, preserving missing keys as visible warnings.
+  if (!ref) {
+    return `
+      <article class="reference-entry missing" data-reference-entry="${escapeAttr(key)}">
+        <span class="reference-key">@${escapeHtml(key)}</span>
+        <span class="reference-title">Missing BibTeX entry</span>
+        <span class="reference-meta">Add this key to the configured bibliography file.</span>
+      </article>
+    `;
+  }
+  const meta = referenceMeta(ref);
+  const link = referenceUrl(ref);
+  return `
+    <article class="reference-entry" data-reference-entry="${escapeAttr(key)}">
+      <span class="reference-key">@${escapeHtml(key)}</span>
+      <span class="reference-title">${escapeHtml(ref.title || key)}</span>
+      <span class="reference-meta">${escapeHtml(meta)}</span>
+      <span class="actions">
+        ${link ? `<a href="${escapeAttr(link)}" target="_blank" rel="noreferrer">Open</a>` : ""}
+        <button data-copy="${escapeAttr(ref.raw || "")}" type="button">Copy BibTeX</button>
+      </span>
+    </article>
+  `;
+}
+
+function referenceMeta(ref) {
+  // Format a compact author-year-venue line.
+  return [ref.author || "", ref.year || "", ref.venue || ""].filter(Boolean).join(". ");
+}
+
+function referenceUrl(ref) {
+  // Prefer explicit URLs, then DOI, then arXiv eprint links.
+  if (ref.url) return ref.url;
+  if (ref.doi) return `https://doi.org/${ref.doi}`;
+  if ((ref.archive_prefix || "").toLowerCase() === "arxiv" && ref.eprint) return `https://arxiv.org/abs/${ref.eprint}`;
+  return "";
+}
+
+function focusReference(key) {
+  // Scroll the context panel to a reference cited from the markdown body.
+  const target = document.querySelector(`[data-reference-entry="${cssEscape(key)}"]`);
+  if (!target) {
+    showToast("Reference not found");
+    return;
+  }
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  document.querySelectorAll(".reference-entry.is-focused").forEach((node) => node.classList.remove("is-focused"));
+  target.classList.add("is-focused");
+  setTimeout(() => target.classList.remove("is-focused"), 1800);
 }
 
 async function markDocRead(path) {
@@ -2751,6 +2877,7 @@ function renderInline(value) {
 
 function renderPlainInline(value) {
   return escapeHtml(value)
+    .replace(/\[((?:[^\]]*@[\w:-]+[^\]]*)+)\]/g, renderCitationGroup)
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, href) => {
@@ -2760,6 +2887,49 @@ function renderPlainInline(value) {
       }
       return `<a href="${escapeAttr(href)}" target="_blank" rel="noreferrer">${label}</a>`;
     });
+}
+
+function renderCitationGroup(match, inner) {
+  // Convert Pandoc-style citation groups such as [@a; @b] into clickable labels.
+  const keys = [];
+  String(inner).replace(/@([A-Za-z][A-Za-z0-9_:-]+)/g, (full, key) => {
+    if (!keys.includes(key)) keys.push(key);
+    return full;
+  });
+  if (!keys.length) return match;
+  return `[${keys.map(renderCitationLink).join("; ")}]`;
+}
+
+function renderCitationLink(key) {
+  // Render one in-text citation from the loaded BibTeX manifest.
+  const ref = (manifest.references || {})[key];
+  const label = ref ? citationLabel(ref, key) : `@${key}`;
+  const title = ref ? referenceMeta(ref) : "Missing BibTeX entry";
+  return `<button class="citation-link ${ref ? "" : "missing"}" data-ref-key="${escapeAttr(key)}" type="button" title="${escapeAttr(title)}">${escapeHtml(label)}</button>`;
+}
+
+function citationLabel(ref, key) {
+  // Use a compact author-year label, falling back to the BibTeX key.
+  const author = citationAuthor(ref.author || "");
+  const year = ref.year || "";
+  if (author && year) return `${author} ${year}`;
+  if (author) return author;
+  if (year) return `${key} ${year}`;
+  return key;
+}
+
+function citationAuthor(authorField) {
+  // Extract a short author label from a BibTeX author field.
+  const authors = String(authorField || "").split(/\s+and\s+/i).map((item) => item.trim()).filter(Boolean);
+  if (!authors.length) return "";
+  const lastNames = authors.map((author) => {
+    if (author.includes(",")) return author.split(",", 1)[0].trim();
+    const parts = author.split(/\s+/).filter(Boolean);
+    return parts[parts.length - 1] || author;
+  });
+  if (lastNames.length === 1) return lastNames[0];
+  if (lastNames.length === 2) return `${lastNames[0]} & ${lastNames[1]}`;
+  return `${lastNames[0]} et al.`;
 }
 
 function normalizeDocHref(href) {
@@ -2926,6 +3096,12 @@ function escapeHtml(value) {
 
 function escapeAttr(value) {
   return escapeHtml(value);
+}
+
+function cssEscape(value) {
+  // Use the browser implementation when available; otherwise escape common selector hazards.
+  if (window.CSS && window.CSS.escape) return window.CSS.escape(String(value));
+  return String(value).replace(/["\\]/g, "\\$&");
 }
 
 init().catch((error) => {
