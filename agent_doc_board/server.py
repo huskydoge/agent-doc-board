@@ -1059,6 +1059,46 @@ select {
   text-decoration-style: dotted;
 }
 
+.markdown-references {
+  margin-top: 44px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.markdown-references h2 {
+  margin-top: 0;
+}
+
+.paper-reference-list {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding-left: 26px;
+}
+
+.paper-reference-item {
+  padding-left: 4px;
+}
+
+.paper-reference-item.is-focused {
+  background: #f7f7f7;
+  outline: 1px solid var(--border);
+  outline-offset: 6px;
+}
+
+.paper-reference-title {
+  font-weight: 700;
+}
+
+.paper-reference-link {
+  display: inline-block;
+  margin-left: 6px;
+  color: #245a8d;
+  font-size: 0.92em;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .read-status {
   display: grid;
   gap: 8px;
@@ -1963,7 +2003,7 @@ async function openDoc(path) {
   activeDocAnnotations = doc.annotations || [];
   docState[doc.path] = doc.state || docState[doc.path] || {};
   el("copy-doc-path").dataset.copy = doc.abs_path;
-  el("reader-content").innerHTML = renderMarkdown(doc.content);
+  el("reader-content").innerHTML = renderMarkdown(doc.content) + renderDocumentReferences(doc);
   el("reader-context").innerHTML = renderDocContext(doc);
   mountCommentPanel();
   bindCommentPanelDrag();
@@ -2053,6 +2093,45 @@ function renderReferencesPanel(doc) {
   `;
 }
 
+function renderDocumentReferences(doc) {
+  // Append a paper-style reference list to the bottom of the rendered document.
+  const citations = doc.citations || [];
+  if (!citations.length) return "";
+  const refs = manifest.references || {};
+  return `
+    <section class="markdown-references" aria-label="References">
+      <h2>References</h2>
+      <ol class="paper-reference-list">
+        ${citations.map((key) => renderPaperReferenceItem(key, refs[key])).join("")}
+      </ol>
+    </section>
+  `;
+}
+
+function renderPaperReferenceItem(key, ref) {
+  // Render one paper-style bibliography item in citation order.
+  if (!ref) {
+    return `
+      <li class="paper-reference-item missing" id="ref-${escapeAttr(key)}" data-reference-entry="${escapeAttr(key)}">
+        <span class="reference-key">@${escapeHtml(key)}</span>. Missing BibTeX entry.
+      </li>
+    `;
+  }
+  const author = ref.author || "Unknown author";
+  const year = ref.year ? ` (${ref.year}).` : ".";
+  const venue = ref.venue ? ` ${ref.venue}.` : "";
+  const link = referenceUrl(ref);
+  const linkLabel = referenceLinkLabel(ref, link);
+  return `
+    <li class="paper-reference-item" id="ref-${escapeAttr(key)}" data-reference-entry="${escapeAttr(key)}">
+      ${escapeHtml(author)}${escapeHtml(year)}
+      <span class="paper-reference-title">${escapeHtml(ref.title || key)}.</span>${escapeHtml(venue)}
+      <span class="reference-key">@${escapeHtml(key)}</span>
+      ${link ? `<a class="paper-reference-link" href="${escapeAttr(link)}" target="_blank" rel="noreferrer">${escapeHtml(linkLabel)}</a>` : ""}
+    </li>
+  `;
+}
+
 function renderReferenceEntry(key, ref) {
   // Render one reference card, preserving missing keys as visible warnings.
   if (!ref) {
@@ -2092,15 +2171,25 @@ function referenceUrl(ref) {
   return "";
 }
 
+function referenceLinkLabel(ref, link) {
+  // Show paper-friendly external-link labels.
+  if ((ref.archive_prefix || "").toLowerCase() === "arxiv" && ref.eprint) return `arXiv:${ref.eprint}`;
+  if (ref.doi) return "doi";
+  if (link) return "link";
+  return "";
+}
+
 function focusReference(key) {
-  // Scroll the context panel to a reference cited from the markdown body.
-  const target = document.querySelector(`[data-reference-entry="${cssEscape(key)}"]`);
+  // Scroll from an in-text citation to the document-bottom reference entry when possible.
+  const target =
+    document.querySelector(`.markdown-references [data-reference-entry="${cssEscape(key)}"]`) ||
+    document.querySelector(`[data-reference-entry="${cssEscape(key)}"]`);
   if (!target) {
     showToast("Reference not found");
     return;
   }
   target.scrollIntoView({ behavior: "smooth", block: "center" });
-  document.querySelectorAll(".reference-entry.is-focused").forEach((node) => node.classList.remove("is-focused"));
+  document.querySelectorAll(".reference-entry.is-focused, .paper-reference-item.is-focused").forEach((node) => node.classList.remove("is-focused"));
   target.classList.add("is-focused");
   setTimeout(() => target.classList.remove("is-focused"), 1800);
 }
