@@ -363,6 +363,10 @@ def _html() -> str:
                 <option value="title-asc">Title A-Z</option>
                 <option value="category-asc">Category</option>
               </select>
+              <label class="archive-toggle">
+                <input id="include-archived" type="checkbox">
+                Show archived
+              </label>
             </div>
           </div>
 
@@ -566,9 +570,22 @@ button, input {
 
 .toolbar-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 170px;
+  grid-template-columns: minmax(0, 1fr) 170px max-content;
   gap: 10px;
   align-items: center;
+}
+
+.archive-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.archive-toggle input {
+  accent-color: var(--text);
 }
 
 .category-list {
@@ -1197,41 +1214,6 @@ select {
   background: #fbfbfb;
 }
 
-.annotation-gutter {
-  position: absolute;
-  inset: 0 auto auto 0;
-  z-index: 42;
-  pointer-events: none;
-}
-
-.annotation-pin {
-  position: absolute;
-  width: 24px;
-  height: 24px;
-  border: 1px solid var(--border);
-  border-radius: 50%;
-  background: var(--paper);
-  color: var(--muted);
-  box-shadow: var(--shadow);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 800;
-  line-height: 1;
-  opacity: 0.35;
-  pointer-events: auto;
-}
-
-.annotation-pin:hover,
-.annotation-pin.has-comments {
-  opacity: 1;
-  color: var(--text);
-  border-color: #cfcfcf;
-}
-
-.annotation-pin.has-comments {
-  background: #f6f6f6;
-}
-
 .annotation-selection-toolbar {
   position: absolute;
   z-index: 75;
@@ -1524,10 +1506,6 @@ select {
     display: none;
   }
 
-  .annotation-gutter {
-    display: none;
-  }
-
   .annotation-selection-toolbar {
     display: none;
   }
@@ -1561,6 +1539,7 @@ let docState = {};
 let activeDocAnnotations = [];
 let activeAnnotationAnchors = {};
 let pendingSelectionAnnotation = null;
+let showArchived = false;
 const COMMENT_PANEL_POSITION_KEY = "agent-doc-board:comment-panel-position:v2";
 
 const el = (id) => document.getElementById(id);
@@ -1582,6 +1561,11 @@ async function init() {
 function bindChrome() {
   el("search").addEventListener("input", renderDocs);
   el("sort-docs").addEventListener("change", renderDocs);
+  el("include-archived").addEventListener("change", (event) => {
+    showArchived = event.target.checked;
+    renderCategories();
+    renderDocs();
+  });
   el("show-list").addEventListener("click", closeReader);
   el("close-reader").addEventListener("click", closeReader);
   el("focus-todo").addEventListener("click", () => el("todo-panel").scrollIntoView({ behavior: "smooth" }));
@@ -1592,7 +1576,6 @@ function bindChrome() {
   });
   window.addEventListener("scroll", () => {
     syncCommentPanelToViewport();
-    reflowAnnotationGutter();
     reflowSelectionAnnotationToolbar();
   }, { passive: true });
   document.addEventListener("selectionchange", handleAnnotationSelectionChange);
@@ -1633,13 +1616,6 @@ function bindChrome() {
       event.preventDefault();
       event.stopPropagation();
       openSelectionAnnotationComposer();
-      return;
-    }
-    const annotationPin = event.target.closest("[data-annotation-pin]");
-    if (annotationPin) {
-      event.preventDefault();
-      event.stopPropagation();
-      openAnnotationComposer(annotationPin.dataset.annotationPin);
       return;
     }
     const annotationJump = event.target.closest("[data-jump-annotation]");
@@ -1696,8 +1672,18 @@ function bindChrome() {
 
 function renderCategories() {
   const holder = el("categories");
-  const total = manifest.docs.length;
-  const categories = [{ id: "all", title: "All", count: total }, ...manifest.categories.filter((category) => category.count > 0)];
+  const visibleDocs = visibleManifestDocs();
+  const total = visibleDocs.length;
+  const categoryCounts = visibleDocs.reduce((counts, doc) => {
+    counts[doc.category] = (counts[doc.category] || 0) + 1;
+    return counts;
+  }, {});
+  const categories = [
+    { id: "all", title: "All", count: total },
+    ...manifest.categories
+      .map((category) => ({ ...category, count: categoryCounts[category.id] || 0 }))
+      .filter((category) => category.count > 0),
+  ];
   holder.innerHTML = categories.map((category) => `
     <button class="tab ${category.id === activeCategory ? "active" : ""}" data-category="${escapeAttr(category.id)}" type="button">
       ${escapeHtml(category.title)} <span class="count">${category.count}</span>
@@ -1826,12 +1812,15 @@ function shortPath(path) {
 
 function renderDocs() {
   const query = el("search").value.trim().toLowerCase();
-  const docs = manifest.docs.filter((doc) => {
+  const visibleDocs = visibleManifestDocs();
+  const docs = visibleDocs.filter((doc) => {
     const categoryOk = activeCategory === "all" || doc.category === activeCategory;
     const haystack = [doc.title, doc.path, doc.summary, doc.category, ...(doc.tags || [])].join(" ").toLowerCase();
     return categoryOk && (!query || haystack.includes(query));
   }).sort(compareDocs);
-  el("stats").textContent = `${docs.length} shown / ${manifest.docs.length} docs`;
+  const archivedCount = (manifest.docs || []).filter(isArchivedDoc).length;
+  const archiveNote = !showArchived && archivedCount ? ` (${archivedCount} archived hidden)` : "";
+  el("stats").textContent = `${docs.length} shown / ${visibleDocs.length} docs${archiveNote}`;
   el("docs").innerHTML = docs.map(renderDocCard).join("");
   document.querySelectorAll("[data-open-doc]").forEach((node) => {
     node.addEventListener("click", (event) => {
@@ -1843,6 +1832,14 @@ function renderDocs() {
     });
   });
   bindCopyButtons();
+}
+
+function visibleManifestDocs() {
+  return (manifest.docs || []).filter((doc) => showArchived || !isArchivedDoc(doc));
+}
+
+function isArchivedDoc(doc) {
+  return doc.status === "archive" || doc.status === "archived";
 }
 
 function compareDocs(a, b) {
@@ -1874,11 +1871,12 @@ function renderDocCard(doc) {
   const readText = state.read_at ? ` · read ${formatDateTime(state.read_at)}` : "";
   const noteText = state.side_comment ? " · side note" : "";
   const commentText = doc.annotation_count ? ` · ${doc.annotation_count} comment${doc.annotation_count === 1 ? "" : "s"}` : "";
+  const statusText = isArchivedDoc(doc) ? " · archived" : "";
   return `
     <article class="post-card" data-open-doc="${escapeAttr(doc.path)}" role="button" tabindex="0">
       <h3>${escapeHtml(doc.title)}${state.read_at ? `<span class="read-mark">Read</span>` : ""}</h3>
       <p class="summary">${escapeHtml(doc.summary || "No summary extracted yet.")}</p>
-      <span class="meta-line">${escapeHtml(formatDate(doc.mtime))} · ${escapeHtml(doc.path)} · ${escapeHtml(tags)}${escapeHtml(relationText)}${escapeHtml(readText)}${escapeHtml(noteText)}${escapeHtml(commentText)}</span>
+      <span class="meta-line">${escapeHtml(formatDate(doc.mtime))} · ${escapeHtml(doc.path)} · ${escapeHtml(tags)}${escapeHtml(statusText)}${escapeHtml(relationText)}${escapeHtml(readText)}${escapeHtml(noteText)}${escapeHtml(commentText)}</span>
       <span class="actions">
         <button data-copy="${escapeAttr(doc.abs_path)}" type="button">Copy Path</button>
         <button data-copy="${escapeAttr(markdownLink)}" type="button">Copy Markdown Link</button>
@@ -1926,7 +1924,6 @@ function closeReader() {
   activeDocAnnotations = [];
   activeAnnotationAnchors = {};
   pendingSelectionAnnotation = null;
-  removeAnnotationGutter();
   hideSelectionAnnotationToolbar();
   closeAnnotationComposer();
   removeFloatingCommentPanel();
@@ -2206,7 +2203,7 @@ function renderAnnotationPanel(doc) {
 function renderAnnotationPanelBody() {
   // Render the active document annotations as jumpable cards.
   if (!activeDocAnnotations.length) {
-    return `<p class="context-empty">No element comments yet. Use the gutter + beside a paragraph, table, math block, code block, or heading.</p>`;
+    return `<p class="context-empty">No element comments yet. Highlight text in the document and choose Add comment.</p>`;
   }
   return activeDocAnnotations.map(renderAnnotationCard).join("");
 }
@@ -2230,8 +2227,7 @@ function renderAnnotationCard(annotation) {
 }
 
 function setupAnnotationLayer() {
-  // Discover rendered markdown elements and place annotation controls beside them.
-  removeAnnotationGutter();
+  // Discover rendered markdown elements so selected text can bind to stable block anchors.
   hideSelectionAnnotationToolbar();
   activeAnnotationAnchors = {};
   if (!activeDocData || isNarrowViewport()) {
@@ -2246,7 +2242,6 @@ function setupAnnotationLayer() {
     target.classList.add("annotation-target");
     activeAnnotationAnchors[anchor.id] = { anchor, target };
   });
-  renderAnnotationGutter();
   refreshAnnotationPanel();
 }
 
@@ -2308,53 +2303,6 @@ function annotationElementText(node) {
 function makeTextFingerprint(value) {
   // Normalize text for anchor matching across small rendering changes.
   return normalizeWhitespace(value).toLowerCase().slice(0, 240);
-}
-
-function renderAnnotationGutter() {
-  // Render the floating add/count buttons that sit beside document blocks.
-  removeAnnotationGutter();
-  const gutter = document.createElement("div");
-  gutter.id = "annotation-gutter";
-  gutter.className = "annotation-gutter";
-  Object.values(activeAnnotationAnchors).forEach(({ anchor }) => {
-    const comments = annotationsForAnchor(anchor);
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `annotation-pin ${comments.length ? "has-comments" : ""}`;
-    button.dataset.annotationPin = anchor.id;
-    button.textContent = comments.length ? String(comments.length) : "+";
-    button.title = comments.length ? `${comments.length} comment(s)` : "Add comment";
-    gutter.appendChild(button);
-  });
-  document.body.appendChild(gutter);
-  reflowAnnotationGutter();
-}
-
-function reflowAnnotationGutter() {
-  // Keep gutter pins aligned with their anchored elements as the page scrolls.
-  const gutter = el("annotation-gutter");
-  if (!gutter) return;
-  gutter.querySelectorAll("[data-annotation-pin]").forEach((button) => {
-    const entry = activeAnnotationAnchors[button.dataset.annotationPin];
-    if (!entry) {
-      button.hidden = true;
-      return;
-    }
-    const rect = entry.target.getBoundingClientRect();
-    const visible = rect.bottom >= 0 && rect.top <= window.innerHeight && rect.width > 0 && rect.height > 0;
-    button.hidden = !visible;
-    if (!visible) return;
-    const left = Math.min(window.scrollX + rect.right + 8, window.scrollX + window.innerWidth - 34);
-    const top = window.scrollY + rect.top + 3;
-    button.style.left = `${Math.round(left)}px`;
-    button.style.top = `${Math.round(top)}px`;
-  });
-}
-
-function removeAnnotationGutter() {
-  // Remove the annotation overlay from the document body.
-  const gutter = el("annotation-gutter");
-  if (gutter) gutter.remove();
 }
 
 function annotationsForAnchor(anchor) {
@@ -2461,7 +2409,6 @@ async function persistAnnotation(payload) {
   activeDocAnnotations = result.annotations || [];
   activeDocData.annotations = activeDocAnnotations;
   refreshAnnotationPanel();
-  renderAnnotationGutter();
 }
 
 function refreshAnnotationPanel() {

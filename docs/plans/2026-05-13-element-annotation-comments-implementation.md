@@ -4,7 +4,7 @@
 
 **Goal:** Build document-bound element comments for Agent Doc Board while renaming the old whole-document comment box to Side Note.
 
-**Architecture:** Keep the existing single-file standard-library server. Store annotations as per-document sidecar JSON files under `.agent-docs/annotations/`. Add a small client-side annotation layer that discovers rendered markdown blocks, places gutter pins, opens a composer, and syncs comments through a new local API.
+**Architecture:** Keep the existing single-file standard-library server. Store annotations as per-document sidecar JSON files under `.agent-docs/annotations/`. Add a small client-side annotation layer that discovers rendered markdown blocks, opens a composer from selected text, and syncs comments through a new local API.
 
 **Tech Stack:** Python standard-library HTTP server, local JSON files, vanilla JavaScript, vanilla CSS.
 
@@ -40,8 +40,8 @@
 **Steps:**
 1. After markdown render and KaTeX render, collect commentable elements.
 2. Generate anchor metadata for each element.
-3. Render a document-level gutter overlay with add/count buttons.
-4. Reflow the gutter on scroll and resize.
+3. Keep anchors invisible and use them only for selected-text binding.
+4. Recompute anchors on resize and document changes.
 
 ### Task 4: Add Composer, Listing, Edit, and Delete
 
@@ -52,7 +52,7 @@
 1. Add a `Comments` context panel.
 2. Add a fixed composer dialog for new/edit annotation comments.
 3. Save/delete annotations through `/api/annotations`.
-4. Refresh the panel and gutter after each mutation.
+4. Refresh the panel after each mutation.
 
 ### Task 5: Validate and Push
 

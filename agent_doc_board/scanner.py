@@ -99,7 +99,7 @@ def _doc_record(root: Path, path: Path, config: ProjectConfig) -> dict:
         "path": rel,
         "abs_path": str(path.resolve()),
         "category": category,
-        "status": _status_for(rel),
+        "status": _status_for(rel, title),
         "tags": _tags_for(rel, category),
         "summary": summary,
         "date": _extract_doc_date(rel, text, stat),
@@ -339,10 +339,11 @@ def _best_pattern_score(rel: str, patterns: tuple[str, ...]) -> int:
     return max(scores, default=-1)
 
 
-def _status_for(rel: str) -> str:
-    """Infer a lightweight document status from its path."""
+def _status_for(rel: str, title: str = "") -> str:
+    """Infer a lightweight document status from its path and title."""
     lowered = rel.lower()
-    if "archive" in lowered or "old" in lowered:
+    lowered_title = title.lower()
+    if "archive" in lowered or "archived" in lowered_title or lowered_title.startswith("archived:"):
         return "archive"
     if lowered.endswith("index.md") or lowered.endswith("todo.md"):
         return "generated"
