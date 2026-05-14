@@ -1232,6 +1232,42 @@ select {
   background: #f6f6f6;
 }
 
+.annotation-selection-toolbar {
+  position: absolute;
+  z-index: 75;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--paper);
+  box-shadow: var(--shadow-strong);
+  padding: 5px 7px;
+  pointer-events: auto;
+}
+
+.annotation-selection-toolbar button {
+  border: 0;
+  border-radius: 999px;
+  background: var(--text);
+  color: white;
+  cursor: pointer;
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1;
+}
+
+.annotation-selection-toolbar span {
+  max-width: 260px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .annotation-panel-body {
   display: grid;
   gap: 9px;
@@ -1492,6 +1528,10 @@ select {
     display: none;
   }
 
+  .annotation-selection-toolbar {
+    display: none;
+  }
+
   .annotation-composer-backdrop {
     align-items: start;
     padding-top: 28px;
@@ -1520,6 +1560,7 @@ let activeDocData = null;
 let docState = {};
 let activeDocAnnotations = [];
 let activeAnnotationAnchors = {};
+let pendingSelectionAnnotation = null;
 const COMMENT_PANEL_POSITION_KEY = "agent-doc-board:comment-panel-position:v2";
 
 const el = (id) => document.getElementById(id);
@@ -1552,7 +1593,19 @@ function bindChrome() {
   window.addEventListener("scroll", () => {
     syncCommentPanelToViewport();
     reflowAnnotationGutter();
+    reflowSelectionAnnotationToolbar();
   }, { passive: true });
+  document.addEventListener("selectionchange", handleAnnotationSelectionChange);
+  document.addEventListener("keyup", (event) => {
+    if (event.key === "Escape") {
+      hideSelectionAnnotationToolbar();
+    }
+  });
+  document.addEventListener("mousedown", (event) => {
+    if (!event.target.closest("[data-selection-annotation-toolbar]")) {
+      hideSelectionAnnotationToolbar();
+    }
+  });
   document.body.addEventListener("click", (event) => {
     const jump = event.target.closest("[data-jump-doc]");
     if (jump && !jump.classList.contains("current")) {
@@ -1573,6 +1626,13 @@ function bindChrome() {
       event.preventDefault();
       event.stopPropagation();
       saveSideComment(saveButton.dataset.saveComment);
+      return;
+    }
+    const selectionComment = event.target.closest("[data-create-selection-comment]");
+    if (selectionComment) {
+      event.preventDefault();
+      event.stopPropagation();
+      openSelectionAnnotationComposer();
       return;
     }
     const annotationPin = event.target.closest("[data-annotation-pin]");
@@ -1855,6 +1915,7 @@ async function openDoc(path) {
   el("reader").hidden = false;
   el("list-view").hidden = true;
   setupAnnotationLayer();
+  hideSelectionAnnotationToolbar();
   el("reader").scrollIntoView({ behavior: "smooth", block: "start" });
   bindCopyButtons();
 }
@@ -1864,7 +1925,9 @@ function closeReader() {
   activeDocData = null;
   activeDocAnnotations = [];
   activeAnnotationAnchors = {};
+  pendingSelectionAnnotation = null;
   removeAnnotationGutter();
+  hideSelectionAnnotationToolbar();
   closeAnnotationComposer();
   removeFloatingCommentPanel();
   el("reader").hidden = true;
@@ -2169,6 +2232,7 @@ function renderAnnotationCard(annotation) {
 function setupAnnotationLayer() {
   // Discover rendered markdown elements and place annotation controls beside them.
   removeAnnotationGutter();
+  hideSelectionAnnotationToolbar();
   activeAnnotationAnchors = {};
   if (!activeDocData || isNarrowViewport()) {
     refreshAnnotationPanel();
@@ -2306,7 +2370,7 @@ function annotationMatchesAnchor(annotation, anchor) {
   return Boolean(saved.text_fingerprint && saved.text_fingerprint === anchor.text_fingerprint);
 }
 
-function openAnnotationComposer(anchorId, annotation = null) {
+function openAnnotationComposer(anchorId, annotation = null, quoteOverride = "") {
   // Open the comment composer for a rendered anchor or an existing annotation.
   const entry = activeAnnotationAnchors[anchorId];
   if (!entry && !annotation) {
@@ -2314,7 +2378,7 @@ function openAnnotationComposer(anchorId, annotation = null) {
     return;
   }
   const anchor = annotation ? annotation.anchor : entry.anchor;
-  const quote = annotation ? annotation.quote : selectedTextWithin(entry.target) || annotationElementText(entry.target);
+  const quote = annotation ? annotation.quote : quoteOverride || selectedTextWithin(entry.target) || annotationElementText(entry.target);
   closeAnnotationComposer();
   const backdrop = document.createElement("div");
   backdrop.className = "annotation-composer-backdrop";
@@ -2447,6 +2511,124 @@ async function copyAnnotationContext(annotationId) {
   ].join("\n");
   await copyText(text);
   showToast("Comment context copied");
+}
+
+function handleAnnotationSelectionChange() {
+  // Show a small Add comment action when text is selected inside the active document.
+  window.clearTimeout(handleAnnotationSelectionChange.timer);
+  handleAnnotationSelectionChange.timer = window.setTimeout(showSelectionAnnotationToolbar, 80);
+}
+
+function showSelectionAnnotationToolbar() {
+  // Position the selection toolbar near a valid text selection inside a commentable block.
+  if (!activeDocData || isNarrowViewport()) {
+    hideSelectionAnnotationToolbar();
+    return;
+  }
+  const selection = window.getSelection ? window.getSelection() : null;
+  if (!selection || selection.isCollapsed || !selection.rangeCount) {
+    hideSelectionAnnotationToolbar();
+    return;
+  }
+  const root = el("reader-content");
+  const range = selection.getRangeAt(0);
+  if (!root || !root.contains(range.commonAncestorContainer)) {
+    hideSelectionAnnotationToolbar();
+    return;
+  }
+  const quote = normalizeWhitespace(selection.toString()).slice(0, 1000);
+  if (!quote) {
+    hideSelectionAnnotationToolbar();
+    return;
+  }
+  const target = annotationTargetForRange(range);
+  if (!target) {
+    hideSelectionAnnotationToolbar();
+    return;
+  }
+  const anchorId = target.dataset.annotationAnchorId;
+  if (!anchorId || !activeAnnotationAnchors[anchorId]) {
+    hideSelectionAnnotationToolbar();
+    return;
+  }
+  const rect = firstVisibleSelectionRect(range);
+  if (!rect) {
+    hideSelectionAnnotationToolbar();
+    return;
+  }
+  pendingSelectionAnnotation = { anchorId, quote };
+  let toolbar = document.querySelector("[data-selection-annotation-toolbar]");
+  if (!toolbar) {
+    toolbar = document.createElement("div");
+    toolbar.className = "annotation-selection-toolbar";
+    toolbar.dataset.selectionAnnotationToolbar = "true";
+    toolbar.innerHTML = `
+      <button data-create-selection-comment type="button">Add comment</button>
+      <span data-selection-annotation-preview></span>
+    `;
+    document.body.appendChild(toolbar);
+  }
+  const preview = toolbar.querySelector("[data-selection-annotation-preview]");
+  if (preview) preview.textContent = shortenText(quote, 80);
+  placeSelectionAnnotationToolbar(toolbar, rect);
+}
+
+function annotationTargetForRange(range) {
+  // Find the closest discovered annotation block for the selection start.
+  const startNode = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer : range.startContainer.parentElement;
+  const commonNode = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? range.commonAncestorContainer : range.commonAncestorContainer.parentElement;
+  const startTarget = startNode ? startNode.closest(".annotation-target") : null;
+  if (startTarget) return startTarget;
+  return commonNode ? commonNode.closest(".annotation-target") : null;
+}
+
+function firstVisibleSelectionRect(range) {
+  // Prefer the first non-empty client rect so multi-line selections place the toolbar near the selected text.
+  const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+  return rects[0] || range.getBoundingClientRect();
+}
+
+function placeSelectionAnnotationToolbar(toolbar, rect) {
+  // Place the toolbar above the selection when possible, otherwise below it.
+  const margin = 8;
+  const toolbarRect = toolbar.getBoundingClientRect();
+  const width = toolbarRect.width || 180;
+  const height = toolbarRect.height || 34;
+  const left = Math.min(Math.max(window.scrollX + rect.left, window.scrollX + margin), window.scrollX + window.innerWidth - width - margin);
+  const above = window.scrollY + rect.top - height - 8;
+  const below = window.scrollY + rect.bottom + 8;
+  const top = above > window.scrollY + margin ? above : below;
+  toolbar.style.left = `${Math.round(left)}px`;
+  toolbar.style.top = `${Math.round(top)}px`;
+}
+
+function reflowSelectionAnnotationToolbar() {
+  // Keep the toolbar aligned while scrolling if the browser selection remains active.
+  const toolbar = document.querySelector("[data-selection-annotation-toolbar]");
+  if (!toolbar || !pendingSelectionAnnotation) return;
+  const selection = window.getSelection ? window.getSelection() : null;
+  if (!selection || selection.isCollapsed || !selection.rangeCount) {
+    hideSelectionAnnotationToolbar();
+    return;
+  }
+  const rect = firstVisibleSelectionRect(selection.getRangeAt(0));
+  if (rect) placeSelectionAnnotationToolbar(toolbar, rect);
+}
+
+function hideSelectionAnnotationToolbar() {
+  // Remove the selection toolbar while preserving saved annotations.
+  document.querySelectorAll("[data-selection-annotation-toolbar]").forEach((node) => node.remove());
+}
+
+function openSelectionAnnotationComposer() {
+  // Convert the current selection into an element-bound comment with a selected-text quote.
+  if (!pendingSelectionAnnotation) {
+    showToast("Select text inside the doc first");
+    return;
+  }
+  const { anchorId, quote } = pendingSelectionAnnotation;
+  hideSelectionAnnotationToolbar();
+  openAnnotationComposer(anchorId, null, quote);
 }
 
 function selectedTextWithin(target) {
